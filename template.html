@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fantasy analytics</title>
+<link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+:root{--bg:#eef1f5;--panel:#fff;--ink:#1b2430;--mute:#5d6b7c;--line:#d9dfe7;--accent:#0f766e;--mine:#fff3c4;--bad:#b42318;--hl:78%}
+@media (prefers-color-scheme:dark){:root{--bg:#10151c;--panel:#18202a;--ink:#e6ebf1;--mute:#97a4b4;--line:#2a3544;--accent:#2dd4bf;--mine:#4a3f12;--bad:#f87171;--hl:30%}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Public Sans",system-ui,sans-serif}
+header,main{max-width:1200px;margin:0 auto;padding:0 20px}
+header{padding-top:28px}
+h1{font-size:1.9rem;font-weight:800;margin:0 0 4px;letter-spacing:-.02em}
+.sub{color:var(--mute);margin:0 0 18px}
+.tabs{display:flex;gap:6px;border-bottom:2px solid var(--line)}
+.tabs button{background:none;border:0;padding:10px 18px;font:600 1rem inherit;font-family:inherit;color:var(--mute);cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px}
+.tabs button[aria-selected=true]{color:var(--ink);border-color:var(--accent)}
+.tabs button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.controls{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}
+select,input{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:inherit}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:20px}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;white-space:nowrap}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line)}
+th:nth-child(-n+5),td:nth-child(-n+5){text-align:left}
+th{cursor:pointer;color:var(--mute);font-weight:600;position:sticky;top:0;background:var(--panel)}
+th[data-dir=asc]::after{content:" \25B2";font-size:.7em}
+th[data-dir=desc]::after{content:" \25BC";font-size:.7em}
+tr.mine td:first-child{box-shadow:inset 4px 0 0 #111;font-weight:600}
+td[class^=h]{color:var(--ink)}
+.legend{display:flex;align-items:center;gap:8px;color:var(--mute);font-size:.85rem;margin:0 2px 8px}
+.legend i{display:inline-block;width:22px;height:12px}
+.flag{color:var(--bad);font-weight:600}
+.note{color:var(--mute);font-size:.85rem;margin:6px 2px 24px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Fantasy analytics</h1>
+  <p class="sub" id="meta"></p>
+  <div class="tabs" role="tablist" id="tabs"></div>
+</header>
+<main>
+  <div class="controls">
+    <select id="pos" aria-label="Position"><option value="">All positions</option><option>QB</option><option>RB</option><option>WR</option><option>TE</option></select>
+    <select id="own" aria-label="Ownership"><option value="">All players</option><option value="mine">My roster</option><option value="fa">Free agents</option><option value="rost">Rostered by others</option></select>
+    <select id="ctr" aria-label="Contract"><option value="">Any contract</option><option value="yr">Contract year only</option></select>
+    <input id="q" type="search" placeholder="Search player" aria-label="Search player">
+  </div>
+  <div class="panel"><div id="chart" style="height:460px"></div></div>
+  <div class="panel tablewrap"><table id="tbl"></table></div>
+  <div class="legend" id="legend"></div>
+  <p class="note">Colors rank each player against others at the same position (min 10 targets or 20 carries): red is the bottom tenth, green is the top tenth. YPC - YAC/Rec compares rushing yards per carry with receiving yards after catch per reception. Season-to-date regular season. Target share, air yards share and WOPR are weekly averages. AY/Tgt = receiving air yards per target. L3 = PPR points per game over the last three games. Source: nflverse and Sleeper.</p>
+</main>
+<script>
+const DATA = __DATA__;
+const COLS = [
+ ["name","Player"],["pos","Pos"],["team","Team"],["age","Age"],["owner","Owner"],
+ ["contract_end","Deal ends"],["gp","GP"],["tgt","Tgt"],["ts","Tgt share"],["ay_tgt","AY/Tgt"],
+ ["ays","AY share"],["wopr","WOPR"],["car","Carries"],["ypc","YPC"],["yac_rec","YAC/Rec"],["gap","YPC - YAC/Rec"],
+ ["ppg","PPR/G"],["l3","L3 PPR/G"]];
+// Heatmap: percentile within position, 10 bins. "need" = minimum volume to be ranked.
+const HEAT = {ts:["tgt",10],ay_tgt:["tgt",10],ays:["tgt",10],wopr:["tgt",10],yac_rec:["tgt",10],
+  ypc:["car",20],ppg:["gp",1],l3:["gp",1],tgt:["gp",1],car:["gp",1]};
+const LOWER = new Set([]); // add stat keys here where a LOWER value is better
+const BINS = {};
+const PCT = new Set(["ts","ays"]);
+const COLORS = {QB:"#7c3aed",RB:"#0f766e",WR:"#d97706",TE:"#2563eb"};
+let league = Object.keys(DATA.leagues)[0], sortKey = "ppg", sortDir = -1;
+const $ = id => document.getElementById(id);
+
+document.getElementById("meta").textContent = `${DATA.season} season, updated ${DATA.updated}`;
+$("tabs").innerHTML = Object.entries(DATA.leagues).map(([k,v]) =>
+  `<button role="tab" data-k="${k}" aria-selected="${k===league}">${v.label}</button>`).join("");
+$("tabs").onclick = e => { const k = e.target.dataset.k; if(!k) return; league = k;
+  [...$("tabs").children].forEach(b => b.setAttribute("aria-selected", b.dataset.k===k)); render(); };
+["pos","own","ctr","q"].forEach(id => $(id).addEventListener("input", render));
+
+function filtered(){
+  const p=$("pos").value, o=$("own").value, c=$("ctr").value, q=$("q").value.toLowerCase();
+  return DATA.leagues[league].rows.filter(r =>
+    (!p||r.pos===p) &&
+    (!o || (o==="mine"&&r.mine) || (o==="fa"&&r.owner==="Free agent") || (o==="rost"&&r.owner!=="Free agent"&&!r.mine)) &&
+    (!c || r.contract_year) && (!q || r.name.toLowerCase().includes(q)));
+}
+function buildBins(){
+  const pool = Object.values(DATA.leagues)[0].rows;
+  for(const [k,[vk,min]] of Object.entries(HEAT)){
+    BINS[k] = {};
+    for(const pos of ["QB","RB","WR","TE"]){
+      BINS[k][pos] = pool.filter(r=>r.pos===pos && r[k]!=null && r[vk]>=min).map(r=>r[k]).sort((a,b)=>a-b);
+    }
+  }
+}
+function heat(r,k){
+  if(!HEAT[k] || r[k]==null || r[HEAT[k][0]]<HEAT[k][1]) return "";
+  const arr = BINS[k][r.pos]; if(!arr || arr.length<5) return "";
+  let lo=0, eq=0; for(const v of arr){ if(v<r[k]) lo++; else if(v===r[k]) eq++; }
+  let p = (lo+eq/2)/arr.length; if(LOWER.has(k)) p = 1-p;
+  return ` class="h${Math.min(9,Math.floor(p*10))}"`;
+}
+// 10 colors, red (weak) -> yellow -> green (strong)
+(function(){ let css=""; for(let i=0;i<10;i++){ const hue=Math.round(4+i*(130/9));
+  css+=`.h${i}{background:hsl(${hue} 70% var(--hl))}`; }
+  const s=document.createElement("style"); s.textContent=css; document.head.appendChild(s); })();
+function fmt(r,k){
+  const v=r[k]; if(v===null||v===undefined) return "";
+  if(k==="contract_end") return r.contract_year?`<span class="flag">${v} (final yr)</span>`:v;
+  if(k==="gap") return (v>0?"+":"")+v.toFixed(2);
+  if(PCT.has(k)) return (v*100).toFixed(1)+"%";
+  return typeof v==="number" && !Number.isInteger(v) ? v.toFixed(2) : v;
+}
+function render(){
+  const rows = filtered().sort((a,b) => {
+    const x=a[sortKey], y=b[sortKey];
+    if(x==null) return 1; if(y==null) return -1;
+    return (x>y?1:x<y?-1:0)*sortDir; });
+  $("tbl").innerHTML = "<thead><tr>"+COLS.map(([k,l])=>`<th data-k="${k}" ${k===sortKey?`data-dir="${sortDir>0?"asc":"desc"}"`:""}>${l}</th>`).join("")
+    +"</tr></thead><tbody>"+rows.slice(0,300).map(r=>`<tr class="${r.mine?"mine":""}">`+COLS.map(([k])=>`<td${heat(r,k)}>${fmt(r,k)}</td>`).join("")+"</tr>").join("")+"</tbody>";
+  $("tbl").querySelectorAll("th").forEach(th => th.onclick = () => {
+    const k=th.dataset.k; sortDir = (k===sortKey)? -sortDir : (k==="name"||k==="pos"||k==="team"||k==="owner"?1:-1); sortKey=k; render(); });
+  const pts = rows.filter(r=>r.ay_tgt!=null && r.tgt>=10);
+  const traces = Object.keys(COLORS).map(pos => { const s=pts.filter(r=>r.pos===pos); return {
+    x:s.map(r=>r.ay_tgt), y:s.map(r=>r.ts*100), text:s.map(r=>`${r.name} (${r.team})<br>${r.owner}<br>${r.ppg} PPR/G`),
+    mode:"markers", name:pos, hoverinfo:"text",
+    marker:{color:COLORS[pos], size:s.map(r=>Math.max(7,Math.min(26,r.ppg*1.4))), opacity:.8,
+            line:{width:s.map(r=>r.mine?3:0), color:"#111"}}}; });
+  const css = getComputedStyle(document.body);
+  Plotly.react("chart", traces, {
+    title:{text:"Depth of target vs. target share (min 10 targets; bubble size = PPR/G; outlined = my roster)", font:{size:14, color:css.color}},
+    xaxis:{title:"Air yards per target"}, yaxis:{title:"Target share (%)"},
+    paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)", font:{color:css.color},
+    margin:{t:50,l:60,r:20,b:50}, legend:{orientation:"h", y:-0.2}}, {responsive:true});
+}
+$("legend").innerHTML = "Weak " + [...Array(10).keys()].map(i=>`<i class="h${i}"></i>`).join("") + " Strong";
+buildBins(); render();
+</script>
+</body>
+</html>

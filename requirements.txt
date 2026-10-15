@@ -1,0 +1,4 @@
+nflreadpy
+pandas
+pyarrow
+requests
